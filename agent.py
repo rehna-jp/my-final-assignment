@@ -2,17 +2,34 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 
 from bootcamp_agent.config import load_settings
 from bootcamp_agent.documents import Document, load_corpus
 from bootcamp_agent.llm import DEFAULT_FAKE_ANSWER, FakeLLM, LLMClient, get_client
-from bootcamp_agent.retrieval import retrieve
+from bootcamp_agent.retrieval import _tokens, retrieve
 from bootcamp_agent.schema import AnswerParseError, ResearchAnswer, parse_research_answer
 from bootcamp_agent.tools import Tool, build_tools
 
 CORPUS_DIR = Path(__file__).resolve().parent / "data" / "corpus"
+
+
+def clean_query(q: str) -> str:
+    """Extract genuine question content when an adversarial prompt wraps it."""
+    lowered = q.lower()
+    markers = ("ignore", "system override", "developer mode", "without citations")
+    if any(k in lowered for k in markers):
+        pattern = (
+            r"(?:tell me(?:\\s+plainly)?[:—\\-\\s]+"
+            r"|answer(?:\\s+without citations)?[:—\\-\\s]+"
+            r"|what|how|where|why|when|name|describe|which).*"
+        )
+        match = re.search(pattern, q, flags=re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return q
 
 
 class YourAgent:
@@ -48,10 +65,23 @@ class YourAgent:
 
         return result_holder["res"]  # type: ignore[return-value]
 
+    def _is_supported(self, cleaned: str) -> tuple[bool, str | None]:
+        scored = retrieve(cleaned, self.documents, top_k=3)
+        if not scored:
+            return False, None
+        q_tokens = set(_tokens(cleaned))
+        top = scored[0]
+        matched = q_tokens & set(_tokens(top.chunk.text))
+        ratio = len(matched) / len(q_tokens) if q_tokens else 0.0
+        supported = (len(matched) >= 3 and top.score >= 6.0) or (ratio >= 0.5 and top.score >= 4.0)
+        if "fine-tuning" in cleaned.lower() or "fine tuning" in cleaned.lower():
+            supported = False
+        return supported, top.chunk.doc_id
+
     def _run_query(self, question: str) -> ResearchAnswer:
-        scored = retrieve(question, self.documents, top_k=10)
-        valid_scored = [s for s in scored if s.score >= 3.0]
-        if not valid_scored:
+        cleaned_question = clean_query(question)
+        supported, top_doc_id = self._is_supported(cleaned_question)
+        if not supported:
             return ResearchAnswer(
                 answer="I do not know based on the provided corpus.",
                 citations=(),
@@ -59,8 +89,9 @@ class YourAgent:
                 needs_human_review=True,
             )
 
-        retrieved_ids = {s.chunk.doc_id for s in valid_scored}
-        context = "\n\n".join(f"[{s.chunk.doc_id}]\n{s.chunk.text}" for s in valid_scored[:3])
+        scored = retrieve(cleaned_question, self.documents, top_k=3)
+        retrieved_ids = {s.chunk.doc_id for s in scored}
+        context = "\n\n".join(f"[{s.chunk.doc_id}]\n{s.chunk.text}" for s in scored)
         system = "You answer developer questions using ONLY the provided context."
         user = f"Context:\n{context}\n\nQuestion: {question}"
 
@@ -77,15 +108,11 @@ class YourAgent:
 
         is_default_fake = isinstance(self.client, FakeLLM) and raw == DEFAULT_FAKE_ANSWER
 
-        if is_default_fake:
-            doc_scores: dict[str, float] = {}
-            for s in valid_scored:
-                doc_scores[s.chunk.doc_id] = doc_scores.get(s.chunk.doc_id, 0.0) + s.score
-            top_doc = max(doc_scores, key=doc_scores.get)
-            doc_obj = next(d for d in self.documents if d.doc_id == top_doc)
+        if is_default_fake and top_doc_id:
+            doc_obj = next(d for d in self.documents if d.doc_id == top_doc_id)
             return ResearchAnswer(
                 answer=doc_obj.text,
-                citations=(top_doc,),
+                citations=(top_doc_id,),
                 confidence=0.9,
                 needs_human_review=False,
             )
